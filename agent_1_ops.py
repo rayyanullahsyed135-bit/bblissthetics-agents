@@ -53,6 +53,14 @@ def get_all_upload_ids(yt_data, uploads_id):
             break
     return video_ids
 
+def draft_comment_reply(prompt: str):
+    for model_name in ["gemini-3.8-flash", "gemini-3.8-flash-lite"]:
+        try:
+            return ai_client.models.generate_content(model=model_name, contents=prompt).text
+        except Exception as e:
+            print(f"    Warning: {model_name} unavailable ({e}), trying fallback...")
+    return None
+
 def run_ops():
     event_name = os.environ.get("GITHUB_EVENT_NAME", "manual")
     print(f"1/5 Authenticating YouTube APIs (Trigger: {event_name})...")
@@ -171,7 +179,7 @@ def run_ops():
             "resonance_score": resonance
         }, on_conflict="video_id,snapshot_date").execute()
 
-    print("5/5 Triaging unanswered comments with Gemini 3.8 Flash...")
+    print("5/5 Triaging unanswered comments with Gemini...")
     drafted_samples = []
     for vid_id in video_ids[:15]:
         try:
@@ -194,7 +202,10 @@ def run_ops():
                 f"Write a warm, grounded, lowercase reply (max 12 words, 1 subtle emoji max, or NONE if spam).\n"
                 f"Output format:\nSENTIMENT: <label>\nREPLY: <text>"
             )
-            res_text = ai_client.models.generate_content(model="gemini-3.8-flash", contents=prompt).text
+            res_text = draft_comment_reply(prompt)
+            if not res_text:
+                continue
+
             lines = res_text.strip().splitlines()
             sentiment = lines[0].replace("SENTIMENT:", "").strip().lower()
             reply = lines[1].replace("REPLY:", "").strip() if len(lines) > 1 else "NONE"
