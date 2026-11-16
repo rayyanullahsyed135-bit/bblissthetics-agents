@@ -108,13 +108,13 @@ def run_ops():
     print("3/5 Querying private 28-day YouTube Analytics...")
     end_date = datetime.date.today().isoformat()
     start_date = (datetime.date.today() - datetime.timedelta(days=28)).isoformat()
-    ana_res = yt_analytics.reports().query(
+   ana_res = yt_analytics.reports().query(
         ids="channel==MINE",
         startDate=start_date,
         endDate=end_date,
         metrics="views,engagedViews,averageViewPercentage,likes,shares,subscribersGained",
         dimensions="video",
-        maxResults=250,
+        maxResults=200,
         sort="-views"
     ).execute()
 
