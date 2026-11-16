@@ -2,7 +2,7 @@ name: Agent 1 - Channel Ops & Telemetry
 
 on:
   schedule:
-    - cron: '0 2,14 * * *' # Runs automatically at 07:30 IST & 19:30 IST
+    - cron: '*/15 * * * *' # Polls every 15 minutes for new uploads & sub changes
   workflow_dispatch:       # Manual trigger button for testing
 
 jobs:
