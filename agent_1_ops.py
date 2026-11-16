@@ -7,11 +7,11 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 
 # --- LOAD SECRETS ---
-SUPABASE_URL = os.environ["SUPABASE_URL"]
-SUPABASE_KEY = os.environ["SUPABASE_KEY"]
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
-TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+SUPABASE_URL = os.environ["SUPABASE_URL"].strip().rstrip("/")
+SUPABASE_KEY = os.environ["SUPABASE_KEY"].strip()
+GEMINI_API_KEY = os.environ["GEMINI_API_KEY"].strip()
+TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"].strip()
+TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"].strip()
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
@@ -19,10 +19,10 @@ ai_client = genai.Client(api_key=GEMINI_API_KEY)
 def get_youtube_clients():
     creds = Credentials(
         token=None,
-        refresh_token=os.environ["YT_REFRESH_TOKEN"],
+        refresh_token=os.environ["YT_REFRESH_TOKEN"].strip(),
         token_uri="https://oauth2.googleapis.com/token",
-        client_id=os.environ["YT_CLIENT_ID"],
-        client_secret=os.environ["YT_CLIENT_SECRET"],
+        client_id=os.environ["YT_CLIENT_ID"].strip(),
+        client_secret=os.environ["YT_CLIENT_SECRET"].strip(),
     )
     yt_data = build("youtube", "v3", credentials=creds)
     yt_analytics = build("youtubeAnalytics", "v2", credentials=creds)
@@ -36,25 +36,74 @@ def send_telegram(message: str):
     )
     resp.raise_for_status()
 
+def get_all_upload_ids(yt_data, uploads_id):
+    video_ids = []
+    next_page_token = None
+    while True:
+        pl_res = yt_data.playlistItems().list(
+            part="contentDetails",
+            playlistId=uploads_id,
+            maxResults=50,
+            pageToken=next_page_token
+        ).execute()
+        for item in pl_res.get("items", []):
+            video_ids.append(item["contentDetails"]["videoId"])
+        next_page_token = pl_res.get("nextPageToken")
+        if not next_page_token:
+            break
+    return video_ids
+
 def run_ops():
-    print("1/5 Authenticating YouTube Data & Analytics APIs...")
+    event_name = os.environ.get("GITHUB_EVENT_NAME", "manual")
+    print(f"1/5 Authenticating YouTube APIs (Trigger: {event_name})...")
     yt_data, yt_analytics = get_youtube_clients()
 
-    print("2/5 Fetching latest 25 videos from @bblissthetics...")
+    print("2/5 Checking @bblissthetics uploads and subscriber count...")
     ch_res = yt_data.channels().list(part="contentDetails,statistics", mine=True).execute()
     channel_item = ch_res["items"][0]
-    subs_count = channel_item["statistics"].get("subscriberCount", "N/A")
+    subs_count = str(channel_item["statistics"].get("subscriberCount", "N/A"))
     uploads_id = channel_item["contentDetails"]["relatedPlaylists"]["uploads"]
 
-    pl_res = yt_data.playlistItems().list(part="contentDetails", playlistId=uploads_id, maxResults=25).execute()
-    video_ids = [item["contentDetails"]["videoId"] for item in pl_res.get("items", [])]
+    video_ids = get_all_upload_ids(yt_data, uploads_id)
     if not video_ids:
-        print("No videos found.")
+        print("No uploads found.")
         return
 
-    vid_res = yt_data.videos().list(part="snippet,statistics", id=",".join(video_ids)).execute()
-    videos = vid_res.get("items", [])
-    print(f"    Found {len(videos)} videos. Current Subscribers: {subs_count}")
+    videos = []
+    for i in range(0, len(video_ids), 50):
+        batch = video_ids[i:i+50]
+        vid_res = yt_data.videos().list(part="snippet,statistics", id=",".join(batch)).execute()
+        videos.extend(vid_res.get("items", []))
+    vid_title_map = {v["id"]: v["snippet"]["title"] for v in videos}
+
+    # --- LIVE CHANGE DETECTION ---
+    state_res = supabase.table("channel_state").select("*").eq("id", 1).execute()
+    prev_state = state_res.data[0] if state_res.data else None
+    live_alerts = []
+
+    if prev_state:
+        prev_subs = str(prev_state.get("last_subs_count", ""))
+        prev_ids = set(prev_state.get("last_known_video_ids") or [])
+        new_uploads = [vid for vid in video_ids if vid not in prev_ids]
+
+        if prev_subs and subs_count != prev_subs:
+            live_alerts.append(f"📈 *Subscriber Update:* `{prev_subs}` → `{subs_count}`")
+
+        for new_id in new_uploads:
+            title = vid_title_map.get(new_id, new_id)
+            live_alerts.append(f"🎬 *New Upload Detected:* _{title}_\nhttps://youtube.com/shorts/{new_id}")
+
+    supabase.table("channel_state").upsert({
+        "id": 1,
+        "last_subs_count": subs_count,
+        "last_known_video_ids": video_ids,
+        "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
+    }).execute()
+
+    if live_alerts:
+        alert_msg = "🚨 *Live Channel Update (@bblissthetics)*\n\n" + "\n\n".join(live_alerts)
+        send_telegram(alert_msg)
+        print("Live update alert sent to Telegram!")
 
     print("3/5 Querying private 28-day YouTube Analytics...")
     end_date = datetime.date.today().isoformat()
@@ -65,7 +114,8 @@ def run_ops():
         endDate=end_date,
         metrics="views,engagedViews,averageViewPercentage,likes,shares,subscribersGained",
         dimensions="video",
-        filters=f"video=={','.join(video_ids)}"
+        maxResults=250,
+        sort="-views"
     ).execute()
 
     ana_map = {
@@ -121,9 +171,9 @@ def run_ops():
             "resonance_score": resonance
         }, on_conflict="video_id,snapshot_date").execute()
 
-    print("5/5 Triaging unanswered comments with Gemini 2.5 Flash...")
+    print("5/5 Triaging unanswered comments with Gemini 3.8 Flash...")
     drafted_samples = []
-    for vid_id in video_ids[:10]:
+    for vid_id in video_ids[:15]:
         try:
             c_res = yt_data.commentThreads().list(part="snippet", videoId=vid_id, maxResults=15, order="time").execute()
         except Exception:
@@ -144,7 +194,7 @@ def run_ops():
                 f"Write a warm, grounded, lowercase reply (max 12 words, 1 subtle emoji max, or NONE if spam).\n"
                 f"Output format:\nSENTIMENT: <label>\nREPLY: <text>"
             )
-            res_text = ai_client.models.generate_content(model="gemini-2.5-flash", contents=prompt).text
+            res_text = ai_client.models.generate_content(model="gemini-3.8-flash", contents=prompt).text
             lines = res_text.strip().splitlines()
             sentiment = lines[0].replace("SENTIMENT:", "").strip().lower()
             reply = lines[1].replace("REPLY:", "").strip() if len(lines) > 1 else "NONE"
@@ -165,17 +215,24 @@ def run_ops():
             if sentiment != "spam":
                 drafted_samples.append(f"• _{text[:40]}_ → `{reply}`")
 
-    sample_block = "\n".join(drafted_samples[:3]) if drafted_samples else "• No new unanswered comments."
-    digest = (
-        f"📡 *Agent 1 Test Report ({today})*\n\n"
-        f"• *Subscribers:* {subs_count}\n"
-        f"• *Tracked Videos:* {len(videos)} (28d Views: {total_28d_views:,})\n"
-        f"• *Top Loop Retention:* _{best_video[0]}_ ({best_video[1]}%)\n"
-        f"• *New Comment Replies Drafted:* {len(drafted_samples)}\n\n"
-        f"*Sample AI Replies (Saved in Supabase):*\n{sample_block}"
-    )
-    send_telegram(digest)
-    print("Done! Telegram report sent.")
+    # Send full summary digest on manual runs OR at 07:30 IST / 19:30 IST (02:00 / 14:00 UTC)
+    current_hour_utc = datetime.datetime.now(datetime.timezone.utc).hour
+    is_digest_hour = current_hour_utc in (2, 14)
+
+    if event_name == "workflow_dispatch" or is_digest_hour:
+        sample_block = "\n".join(drafted_samples[:3]) if drafted_samples else "• No new unanswered comments."
+        digest = (
+            f"📡 *Agent 1 Report ({today})*\n\n"
+            f"• *Subscribers (API):* {subs_count}\n"
+            f"• *Tracked Uploads (Shorts + Videos):* {len(videos)} (28d Views: {total_28d_views:,})\n"
+            f"• *Top Loop Retention:* _{best_video[0]}_ ({best_video[1]}%)\n"
+            f"• *New Comment Replies Drafted:* {len(drafted_samples)}\n\n"
+            f"*Sample AI Replies (Saved in Supabase):*\n{sample_block}"
+        )
+        send_telegram(digest)
+        print("Full summary digest sent.")
+    else:
+        print("Background check complete (no digest scheduled this run).")
 
 if __name__ == "__main__":
     run_ops()
