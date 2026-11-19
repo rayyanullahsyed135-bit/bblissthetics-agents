@@ -1,22 +1,19 @@
 import os
 import re
-import json
 import datetime
 import requests
 from supabase import create_client, Client
-from google import genai
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
+from llm_router import generate_ai_text
 
 # --- LOAD SECRETS ---
 SUPABASE_URL = os.environ["SUPABASE_URL"].strip().rstrip("/")
 SUPABASE_KEY = os.environ["SUPABASE_KEY"].strip()
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"].strip()
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"].strip().removeprefix("bot")
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"].strip()
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
 
 def get_youtube_clients():
@@ -43,7 +40,6 @@ def send_telegram(message: str, reply_markup: dict = None, parse_mode: str = "Ma
     resp = requests.post(url, json=payload)
     if not resp.ok:
         print(f"Telegram API Warning {resp.status_code}: {resp.text}")
-        # Fallback to plain text if Markdown formatting fails on special characters
         if parse_mode:
             payload.pop("parse_mode", None)
             resp = requests.post(url, json=payload)
@@ -113,7 +109,6 @@ def process_telegram_approvals(yt_data):
                     json={"chat_id": TELEGRAM_CHAT_ID, "message_id": msg_id, "reply_markup": {"inline_keyboard": []}}
                 )
 
-    # Acknowledge processed Telegram updates so they don't repeat
     if max_update_id > 0:
         requests.get(url, params={"offset": max_update_id + 1})
 
@@ -157,7 +152,6 @@ def auto_hygiene_and_playlist(yt_data, video_obj):
         except Exception as e:
             print(f"    Metadata hygiene skipped for {vid_id}: {e}")
 
-    # Match upload keywords against existing channel playlists
     try:
         pl_res = yt_data.playlists().list(part="snippet", mine=True, maxResults=25).execute()
         title_lower = new_title.lower()
@@ -201,7 +195,7 @@ def get_all_upload_ids(yt_data, uploads_id):
 
 
 def generate_content_diagnostic(today: str, ranked_videos: list) -> str:
-    """Analyzes proven winners vs underperformers to guide original script, hook, audio & subtitle creation."""
+    """Analyzes proven winners vs underperformers via llm_router (local Ollama -> Gemini fallback)."""
     proven = [v for v in ranked_videos if v["views"] >= 500]
     if len(proven) < 5:
         proven = ranked_videos
@@ -234,8 +228,7 @@ Provide a sharp, concrete diagnostic with 4 exact sections (no fluff, under 280 
 4. TOP 3 THEMES TO DOUBLE DOWN ON: Specific emotional angles for the 25-34 male audience."""
 
     try:
-        res = ai_client.models.generate_content(model="gemini-3.8-flash", contents=prompt)
-        analysis_text = res.text.strip()
+        analysis_text = generate_ai_text(prompt)
 
         supabase.table("creative_insights").upsert({
             "insight_date": today,
@@ -343,7 +336,6 @@ def run_ops():
         for r in ana_res.get("rows", [])
     }
 
-    # Exact 28d Net Subscriber Velocity & YPP Progress
     net_28d_subs = sum((m["subs_gained"] - m["subs_lost"]) for m in ana_map.values())
 
     ypp_90d_res = yt_analytics.reports().query(
@@ -392,7 +384,6 @@ def run_ops():
             "resonance": resonance
         })
 
-        # Filter out <500-view statistical noise when picking top retention winner
         if views >= 500 and apv > best_proven_video[1]:
             best_proven_video = (snip["title"][:35], apv, views)
 
@@ -409,13 +400,13 @@ def run_ops():
             "resonance_score": resonance
         }, on_conflict="video_id,snapshot_date").execute()
 
-    print("6/6 Triaging unanswered comments (max 3/run) with 1-tap Telegram approval...")
+    print("6/6 Triaging unanswered comments via llm_router (max 3/run) with 1-tap Telegram approval...")
     ai_calls = 0
-    quota_exhausted = False
+    ai_unavailable = False
     new_drafts_count = 0
 
     for vid_id in video_ids[:5]:
-        if ai_calls >= 3 or quota_exhausted:
+        if ai_calls >= 3 or ai_unavailable:
             break
         try:
             c_res = yt_data.commentThreads().list(part="snippet", videoId=vid_id, maxResults=10, order="time").execute()
@@ -423,7 +414,7 @@ def run_ops():
             continue
 
         for item in c_res.get("items", []):
-            if ai_calls >= 3 or quota_exhausted:
+            if ai_calls >= 3 or ai_unavailable:
                 break
             if item["snippet"]["totalReplyCount"] > 0:
                 continue
@@ -440,11 +431,11 @@ def run_ops():
                 f"Output format:\nSENTIMENT: <label>\nREPLY: <text>"
             )
             try:
-                res_text = ai_client.models.generate_content(model="gemini-3.8-flash", contents=prompt).text
+                res_text = generate_ai_text(prompt)
                 ai_calls += 1
             except Exception as e:
                 print(f"    Skipping AI comment triage ({e})")
-                quota_exhausted = True
+                ai_unavailable = True
                 break
 
             lines = res_text.strip().splitlines()
@@ -501,7 +492,6 @@ def run_ops():
         )
         send_telegram(digest)
 
-        # Generate & send Deep Content, Script & Hook Diagnostic for Agent 2 & Agent 3
         diagnostic = generate_content_diagnostic(today, ranked_videos)
         if diagnostic:
             diag_msg = f"🧠 *Agent 1 Deep Hook & Script Analysis (Saved for Agent 2)*\n\n{diagnostic}"
